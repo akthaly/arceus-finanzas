@@ -228,8 +228,13 @@ def analizar_temporadas_festivas_gt(
     }
 
 
-def calcular_ventana_pago(fecha_actual: dt.date, dias_pago: list[int]) -> dict[str, Any]:
-    dias_ordenados = sorted(set(dias_pago)) or [15, 30]
+def calcular_ventana_pago(
+    fecha_actual: dt.date,
+    dias_pago: list[int],
+    frecuencia_pago: str = "quincenal",
+) -> dict[str, Any]:
+    es_mensual = frecuencia_pago.lower() == "mensual" or len(set(dias_pago)) == 1
+    dias_ordenados = sorted(set(dias_pago)) or ([30] if es_mensual else [15, 30])
     candidatos: list[dt.date] = []
     y, m = prev_month(fecha_actual.year, fecha_actual.month)
     for _ in range(4):
@@ -241,10 +246,16 @@ def calcular_ventana_pago(fecha_actual: dt.date, dias_pago: list[int]) -> dict[s
     futuros = [c for c in candidatos if (c - fecha_actual).days > 4]
     proximo_pago = futuros[0]
     subsiguiente_pago = futuros[1]
-    quincena_num = 1 if fecha_actual.day <= 20 else 2
-    codigo_periodo = f"{fecha_actual.year:04d}-{fecha_actual.month:02d}-Q{quincena_num}"
+
+    if es_mensual:
+        codigo_periodo = f"{fecha_actual.year:04d}-{fecha_actual.month:02d}-M"
+    else:
+        quincena_num = 1 if fecha_actual.day <= 20 else 2
+        codigo_periodo = f"{fecha_actual.year:04d}-{fecha_actual.month:02d}-Q{quincena_num}"
 
     return {
+        "es_mensual": es_mensual,
+        "pagos_por_mes": 1 if es_mensual else 2,
         "fecha_inicio": fecha_actual,
         "proximo_pago": proximo_pago,
         "subsiguiente_pago": subsiguiente_pago,
@@ -341,7 +352,8 @@ def planificar_quincena(
 ) -> dict[str, Any]:
     simbolo = perfil.get("simbolo_moneda", "$")
     moneda = perfil.get("moneda", "USD")
-    dias_pago = perfil.get("dias_pago", [15, 30])
+    frecuencia_pago = str(perfil.get("frecuencia_pago", "quincenal")).lower()
+    dias_pago = perfil.get("dias_pago", [30] if frecuencia_pago == "mensual" else [15, 30])
     reglas = perfil.get("reglas_liquidez", {})
 
     piso_libres = float(reglas.get("piso_gastos_libres_quincenal", 500.0))
@@ -350,7 +362,8 @@ def planificar_quincena(
     pct_ahorro_min = float(reglas.get("porcentaje_ahorro_minimo", 15.0))
     pct_ahorro_excedente = float(reglas.get("porcentaje_ahorro_excedente", 70.0))
 
-    ventana = calcular_ventana_pago(fecha_pago, dias_pago)
+    ventana = calcular_ventana_pago(fecha_pago, dias_pago, frecuencia_pago)
+    es_mensual: bool = ventana["es_mensual"]
     f_ini: dt.date = ventana["fecha_inicio"]
     f_prox: dt.date = ventana["proximo_pago"]
     f_sub: dt.date = ventana["subsiguiente_pago"]
@@ -367,7 +380,8 @@ def planificar_quincena(
         if metodo not in cubetas:
             metodo = "debito"
 
-        es_prorrateable = suavizar and (
+        # En pago mensual todos los gastos del mes se cubren al 100% en este ingreso (no se dividen entre 2 quincenas)
+        es_prorrateable = (not es_mensual) and suavizar and (
             bool(gasto.get("prorratear_entre_quincenas", False)) or monto_total >= umbral_grande
         )
         fecha_venc = proxima_ocurrencia_dia(f_ini, dia_pago)
@@ -380,7 +394,7 @@ def planificar_quincena(
                 )
             else:
                 monto_de_este_ingreso = round(monto_total, 2)
-                nota_prorrateo = "100% esta quincena"
+                nota_prorrateo = "100% este periodo"
 
             pagos_esta_quincena.append(
                 {
@@ -522,11 +536,16 @@ def planificar_quincena(
         2,
     )
 
+    # Para usuarios de pago mensual, dividimos sus gastos libres en 4 semanas ("Blindaje 4 Semanas")
+    # para que no gasten toda su liquidez en la semana 1 y lleguen holgados a fin de mes.
+    presupuesto_semanal_libres = round(gastos_libres / (4.0 if es_mensual else 2.0), 2)
+
     return {
         "meta": {
             "usuario": perfil.get("nombre_usuario", "Usuario"),
             "moneda": moneda,
             "simbolo": simbolo,
+            "frecuencia_pago": "mensual" if es_mensual else "quincenal",
             "fecha_pago": f_ini.isoformat(),
             "proximo_pago": f_prox.isoformat(),
             "dias_ventana": ventana["dias_ventana"],
@@ -541,6 +560,7 @@ def planificar_quincena(
             "gasto_extra": round(gasto_extra, 2),
             "nota_gasto_extra": nota_extra,
             "gastos_libres_salidas": gastos_libres,
+            "presupuesto_semanal_libres": presupuesto_semanal_libres,
             "ahorro_fuerte_total": ahorro_total,
             "porcentaje_ahorro_real": porcentaje_ahorro_real,
             "verificacion_suma_exacta": verificacion_suma,
@@ -568,10 +588,13 @@ def evaluar_compra(
     categoria = detectar_categoria_compra(nombre_compra, categoria_compra)
 
     plan_ref = planificar_quincena(perfil, ingreso_ref, fecha_actual)
-    ahorro_quincenal_tipico = max(0.0, plan_ref["resumen_montos"]["ahorro_fuerte_total"])
-    ahorro_mensual_tipico = round(ahorro_quincenal_tipico * 2.0, 2)
+    es_mensual = plan_ref["meta"].get("frecuencia_pago") == "mensual"
+    pagos_por_mes = 1.0 if es_mensual else 2.0
+    ahorro_por_pago_tipico = max(0.0, plan_ref["resumen_montos"]["ahorro_fuerte_total"])
+    ahorro_mensual_tipico = round(ahorro_por_pago_tipico * pagos_por_mes, 2)
+    ahorro_quincenal_tipico = ahorro_por_pago_tipico
 
-    cuota_quincenal_segura = round(ahorro_quincenal_tipico * 0.40, 2)
+    cuota_quincenal_segura = round(ahorro_por_pago_tipico * 0.40, 2)
 
     tarjetas = perfil.get("tarjetas_credito", [])
     info_tc: dict[str, Any] | None = None
@@ -640,8 +663,8 @@ def evaluar_compra(
     opciones_cuotas = []
     for n_meses in (3, 6, 12):
         cuota_mes = round(monto_compra / n_meses, 2)
-        cuota_q = round(cuota_mes / 2.0, 2)
-        holgado = cuota_q <= max(cuota_quincenal_segura, ahorro_quincenal_tipico * 0.50)
+        cuota_q = round(cuota_mes / pagos_por_mes, 2)
+        holgado = cuota_q <= max(cuota_quincenal_segura, ahorro_por_pago_tipico * 0.50)
         opciones_cuotas.append(
             {
                 "plazo_meses": n_meses,
@@ -780,10 +803,12 @@ def renderizar_markdown(plan: dict[str, Any], compact: bool = False) -> str:
     r = plan["resumen_montos"]
     a = plan["acciones_dia_pago"]
     s = m["simbolo"]
+    es_mensual = m.get("frecuencia_pago") == "mensual"
+    titulo_plan = "Plan Mensual Arceus" if es_mensual else "Plan Quincenal Arceus"
 
     lines: list[str] = [
-        f"# Plan Quincenal Arceus — {m['codigo_periodo']} ({m['fecha_pago']} → {m['proximo_pago']})",
-        f"**Ingreso:** `{s}{r['ingreso_quincena']:,.2f}` | **Ahorro Fuerte:** `{s}{r['ahorro_fuerte_total']:,.2f}` (`{r['porcentaje_ahorro_real']}%`) | **Libre (Salidas):** `{s}{r['gastos_libres_salidas']:,.2f}`",
+        f"# {titulo_plan} — {m['codigo_periodo']} ({m['fecha_pago']} → {m['proximo_pago']})",
+        f"**Ingreso:** `{s}{r['ingreso_quincena']:,.2f}` | **Ahorro Fuerte:** `{s}{r['ahorro_fuerte_total']:,.2f}` (`{r['porcentaje_ahorro_real']}%`) | **Libre (Salidas):** `{s}{r['gastos_libres_salidas']:,.2f}` (`{s}{r['presupuesto_semanal_libres']:,.2f}/semana`)",
         "",
     ]
 

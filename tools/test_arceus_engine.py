@@ -70,6 +70,25 @@ class TestArceusEngine(unittest.TestCase):
         self.assertEqual(ev["compra"]["categoria"], "ropa")
         self.assertEqual(len(ev["temporadas_festivas_guatemala"]["comparativa_fechas_festivas"]), 4)
 
+    def test_planificacion_mensual_4_semanas(self) -> None:
+        perfil_mensual = dict(self.perfil)
+        perfil_mensual["frecuencia_pago"] = "mensual"
+        perfil_mensual["dias_pago"] = [30]
+        plan = planificar_quincena(
+            perfil=perfil_mensual,
+            ingreso=9000.0,
+            fecha_pago=dt.date(2026, 11, 30),
+        )
+        self.assertEqual(plan["meta"]["frecuencia_pago"], "mensual")
+        self.assertEqual(plan["meta"]["codigo_periodo"], "2026-11-M")
+        self.assertEqual(plan["resumen_montos"]["verificacion_suma_exacta"], 9000.0)
+        # En modo mensual el presupuesto semanal libre es gastos_libres / 4
+        self.assertAlmostEqual(
+            plan["resumen_montos"]["presupuesto_semanal_libres"] * 4.0,
+            plan["resumen_montos"]["gastos_libres_salidas"],
+            delta=0.05,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
