@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
 Motor determinista de Arceus Finanzas (tools/arceus_engine.py).
-
-Resuelve los dos problemas clásicos de usar un LLM puro para finanzas:
-1. Fechas exactas: calcula ventanas reales del calendario entre días de pago,
-   vencimientos de gastos fijos y fechas de corte/límite de tarjeta de crédito.
-2. Matemáticas exactas al centavo: suma cubetas (efectivo, transferencia, débito,
-   apartado de tarjeta de crédito), aplica prorrateo ("anti-apretón") para gastos
-   fuertes, protege el piso de gastos libres/salidas y calcula el ahorro fuerte.
+Optimizado para bajo consumo de tokens: resuelve en 1 sola llamada:
+1. Planificación quincenal exacta (--ingreso)
+2. Evaluador de compras y calendario óptimo de compra (--evaluar-compra)
+3. Verificación de estado de configuración (--check-setup)
 """
 
 from __future__ import annotations
@@ -25,40 +22,53 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_PROFILE_PATH = ROOT_DIR / "perfil" / "usuario.json"
 EXAMPLE_PROFILE_PATH = ROOT_DIR / "perfil" / "usuario.example.json"
 HISTORIAL_CSV_PATH = ROOT_DIR / "historial" / "quincenas.csv"
-REPORTES_DIR = ROOT_DIR / "reportes"
+REPORTES_DIR = ROOTES_DIR = ROOT_DIR / "reportes"
 
 
 def clamp_day(year: int, month: int, day: int) -> dt.date:
-    """Convierte un día (1..31) en una fecha válida del mes (ajustando 28/29/30/31)."""
     last_day = calendar.monthrange(year, month)[1]
     return dt.date(year, month, min(max(1, day), last_day))
 
 
 def next_month(year: int, month: int) -> tuple[int, int]:
-    if month == 12:
-        return year + 1, 1
-    return year, month + 1
+    return (year + 1, 1) if month == 12 else (year, month + 1)
 
 
 def prev_month(year: int, month: int) -> tuple[int, int]:
-    if month == 1:
-        return year - 1, 12
-    return year, month - 1
+    return (year - 1, 12) if month == 1 else (year, month - 1)
+
+
+def proxima_ocurrencia_dia(desde: dt.date, dia_mes: int) -> dt.date:
+    cand_actual = clamp_day(desde.year, desde.month, dia_mes)
+    if cand_actual >= desde:
+        return cand_actual
+    ny, nm = next_month(desde.year, desde.month)
+    return clamp_day(ny, nm, dia_mes)
+
+
+def calcular_ciclo_tc_para_fecha(
+    fecha_compra: dt.date, dia_corte: int, dia_limite_pago: int
+) -> dict[str, Any]:
+    """
+    Calcula para una fecha de compra específica:
+    - En qué fecha de corte entra esa compra
+    - Cuál es la fecha límite de pago para no generar intereses (0%)
+    - Cuántos días reales de financiamiento gratis obtiene el usuario
+    """
+    corte_compra = proxima_ocurrencia_dia(fecha_compra, dia_corte)
+    # La fecha límite de pago siempre es posterior a la fecha de corte en que cierra el estado
+    limite_pago = proxima_ocurrencia_dia(corte_compra + dt.timedelta(days=1), dia_limite_pago)
+    dias_financiamiento = (limite_pago - fecha_compra).days
+    return {
+        "fecha_compra": fecha_compra.isoformat(),
+        "fecha_corte": corte_compra.isoformat(),
+        "fecha_limite_pago": limite_pago.isoformat(),
+        "dias_financiamiento_gratis": dias_financiamiento,
+    }
 
 
 def calcular_ventana_pago(fecha_actual: dt.date, dias_pago: list[int]) -> dict[str, Any]:
-    """
-    Dado el día en que se recibe el pago (fecha_actual) y la lista de días de pago
-    mensuales (ej. [15, 30]), devuelve:
-    - fecha_inicio: fecha_actual
-    - proximo_pago: fecha exacta del siguiente día de pago
-    - fin_siguiente_ventana: fecha exacta del pago subsiguiente (para prorratear
-      gastos grandes que vencen en la siguiente quincena)
-    - codigo_periodo: ej. '2026-11-Q2'
-    """
     dias_ordenados = sorted(set(dias_pago)) or [15, 30]
-
-    # Generar fechas candidatas de pago en mes anterior, actual y siguientes 2 meses
     candidatos: list[dt.date] = []
     y, m = prev_month(fecha_actual.year, fecha_actual.month)
     for _ in range(4):
@@ -67,12 +77,9 @@ def calcular_ventana_pago(fecha_actual: dt.date, dias_pago: list[int]) -> dict[s
         y, m = next_month(y, m)
     candidatos = sorted(set(candidatos))
 
-    # Si hoy está a 1-3 días antes de un día de pago oficial (ej. pagan viernes 13 en vez del 15),
-    # saltamos ese día de pago inmediato para que la ventana cubra toda la quincena real.
     futuros = [c for c in candidatos if (c - fecha_actual).days > 4]
     proximo_pago = futuros[0]
     subsiguiente_pago = futuros[1]
-
     quincena_num = 1 if fecha_actual.day <= 20 else 2
     codigo_periodo = f"{fecha_actual.year:04d}-{fecha_actual.month:02d}-Q{quincena_num}"
 
@@ -85,15 +92,6 @@ def calcular_ventana_pago(fecha_actual: dt.date, dias_pago: list[int]) -> dict[s
     }
 
 
-def proxima_ocurrencia_dia(desde: dt.date, dia_mes: int) -> dt.date:
-    """Devuelve la primera fecha >= `desde` cuyo día del mes corresponde a `dia_mes`."""
-    cand_actual = clamp_day(desde.year, desde.month, dia_mes)
-    if cand_actual >= desde:
-        return cand_actual
-    ny, nm = next_month(desde.year, desde.month)
-    return clamp_day(ny, nm, dia_mes)
-
-
 def analizar_tarjeta_credito(
     tc: dict[str, Any],
     fecha_inicio: dt.date,
@@ -101,11 +99,6 @@ def analizar_tarjeta_credito(
     cargos_tc_quincena: float,
     simbolo: str,
 ) -> dict[str, Any]:
-    """
-    Calcula fechas exactas de corte y límite de pago de la tarjeta de crédito,
-    determina si toca liquidar el saldo al corte en esta quincena, calcula el uso
-    del límite (regla del <30%) y genera consejos prácticos para principiantes.
-    """
     dia_corte = int(tc.get("dia_corte", 10))
     dia_limite = int(tc.get("dia_limite_pago", 28))
     limite_credito = float(tc.get("limite_credito", 0.0))
@@ -114,6 +107,9 @@ def analizar_tarjeta_credito(
 
     proximo_corte = proxima_ocurrencia_dia(fecha_inicio, dia_corte)
     proximo_limite = proxima_ocurrencia_dia(fecha_inicio, dia_limite)
+    fecha_oro_compra = proximo_corte + dt.timedelta(days=1)
+    ciclo_hoy = calcular_ciclo_tc_para_fecha(fecha_inicio, dia_corte, dia_limite)
+    ciclo_oro = calcular_ciclo_tc_para_fecha(fecha_oro_compra, dia_corte, dia_limite)
 
     dias_para_corte = (proximo_corte - fecha_inicio).days
     dias_para_limite = (proximo_limite - fecha_inicio).days
@@ -128,44 +124,32 @@ def analizar_tarjeta_credito(
     limite_saludable_30 = round(limite_credito * 0.30, 2)
 
     consejos: list[str] = []
-    if dias_para_corte <= 4:
+    if dias_para_corte <= 5:
         consejos.append(
-            f"Tu fecha de corte es muy pronto ({proximo_corte.isoformat()}, en {dias_para_corte} días). "
-            "Lo que compres hoy con la TC entrará en el estado de cuenta que cierra ya. "
-            "Si tienes una compra grande no urgente, espera un día después del corte para ganar ~45 días sin intereses."
+            f"Corte próximo ({proximo_corte.isoformat()}, en {dias_para_corte}d). "
+            f"Mejor fecha para compras grandes: desde el {fecha_oro_compra.isoformat()} "
+            f"(ganas {ciclo_oro['dias_financiamiento_gratis']}d sin intereses, pagas hasta {ciclo_oro['fecha_limite_pago']})."
         )
     else:
         consejos.append(
-            f"Estás en buena ventana de financiamiento: tu próximo corte es el {proximo_corte.isoformat()} "
-            f"(faltan {dias_para_corte} días)."
+            f"Si compras hoy tienes {ciclo_hoy['dias_financiamiento_gratis']}d sin intereses (pagas el {ciclo_hoy['fecha_limite_pago']}). "
+            f"Próxima ventana de oro (~{ciclo_oro['dias_financiamiento_gratis']}d): {fecha_oro_compra.isoformat()}."
         )
 
     if vence_en_esta_quincena and saldo_corte_pendiente > 0:
         consejos.append(
-            f"ATENCIÓN TOTALERO: Tu fecha límite de pago ({proximo_limite.isoformat()}) cae en esta quincena. "
-            f"Paga el 'Pago de contado / Para no generar intereses' ({simbolo}{saldo_corte_pendiente:,.2f}) "
-            "al menos 2 días antes de esa fecha."
+            f"TOTALERO: Liquida {simbolo}{saldo_corte_pendiente:,.2f} antes del {proximo_limite.isoformat()}."
         )
 
     if cargos_tc_quincena > 0:
         consejos.append(
-            f"Regla de oro de tu 1ra TC: aunque pagues {simbolo}{cargos_tc_quincena:,.2f} con tarjeta de crédito, "
-            "ese dinero NO es dinero extra. Ya quedó apartado en tu cuenta de débito para que cuando llegue la fecha "
-            "de pago liquides al 100% sin tocar tu ahorro ni pagar un solo centavo de intereses."
+            f"Apartado TC en débito: {simbolo}{cargos_tc_quincena:,.2f} reservados para pagar 0% intereses."
         )
 
     if limite_credito > 0:
-        if porcentaje_uso > 30.0:
-            consejos.append(
-                f"Tu uso proyectado de la TC es {porcentaje_uso}% del límite ({simbolo}{limite_credito:,.2f}). "
-                f"Para construir un historial crediticio excelente, intenta mantener el saldo al corte por debajo del 30% "
-                f"({simbolo}{limite_saludable_30:,.2f}) haciendo un abono antes del día {dia_corte}."
-            )
-        else:
-            consejos.append(
-                f"Uso de línea de crédito saludable ({porcentaje_uso}% <= 30% recomendado; tope ideal al corte: "
-                f"{simbolo}{limite_saludable_30:,.2f})."
-            )
+        consejos.append(
+            f"Uso de línea: {porcentaje_uso}% (tope saludable 30%: {simbolo}{limite_saludable_30:,.2f})."
+        )
 
     return {
         "nombre": tc.get("nombre", "Tarjeta de Crédito"),
@@ -173,6 +157,9 @@ def analizar_tarjeta_credito(
         "dias_para_corte": dias_para_corte,
         "proximo_limite_pago": proximo_limite.isoformat(),
         "dias_para_limite_pago": dias_para_limite,
+        "ventana_oro_compras": fecha_oro_compra.isoformat(),
+        "dias_financiamiento_hoy": ciclo_hoy["dias_financiamiento_gratis"],
+        "dias_financiamiento_ventana_oro": ciclo_oro["dias_financiamiento_gratis"],
         "vence_en_esta_quincena": vence_en_esta_quincena,
         "cargos_tc_quincena": round(cargos_tc_quincena, 2),
         "pago_saldo_anterior_en_quincena": round(pago_saldo_anterior, 2),
@@ -191,13 +178,6 @@ def planificar_quincena(
     nota_extra: str = "",
     usar_prorrateo_previo: bool = True,
 ) -> dict[str, Any]:
-    """
-    Calcula el plan completo de la quincena:
-    - Calendario de pagos directos en la ventana actual
-    - Apartados prorrateados (50%) de pagos grandes de la siguiente ventana
-    - Resumen por método de pago (efectivo, transferencia, débito, tarjeta de crédito)
-    - Distribución entre Gastos Libres (salidas) y Ahorro Fuerte
-    """
     simbolo = perfil.get("simbolo_moneda", "$")
     moneda = perfil.get("moneda", "USD")
     dias_pago = perfil.get("dias_pago", [15, 30])
@@ -216,13 +196,7 @@ def planificar_quincena(
 
     pagos_esta_quincena: list[dict[str, Any]] = []
     apartados_siguiente_quincena: list[dict[str, Any]] = []
-
-    cubetas = {
-        "efectivo": 0.0,
-        "transferencia": 0.0,
-        "debito": 0.0,
-        "tc": 0.0,
-    }
+    cubetas = {"efectivo": 0.0, "transferencia": 0.0, "debito": 0.0, "tc": 0.0}
 
     for gasto in perfil.get("gastos_fijos", []):
         nombre = gasto["nombre"]
@@ -235,21 +209,17 @@ def planificar_quincena(
         es_prorrateable = suavizar and (
             bool(gasto.get("prorratear_entre_quincenas", False)) or monto_total >= umbral_grande
         )
-
         fecha_venc = proxima_ocurrencia_dia(f_ini, dia_pago)
 
         if f_ini <= fecha_venc < f_prox:
-            # Vence en ESTA quincena
             if es_prorrateable and usar_prorrateo_previo:
                 monto_de_este_ingreso = round(monto_total / 2.0, 2)
                 nota_prorrateo = (
-                    f"Pagas {simbolo}{monto_total:,.2f} en total el {fecha_venc.isoformat()} "
-                    f"({simbolo}{monto_de_este_ingreso:,.2f} de este pago + "
-                    f"{simbolo}{monto_total - monto_de_este_ingreso:,.2f} apartados la quincena pasada)"
+                    f"50% hoy ({simbolo}{monto_de_este_ingreso:,.2f}) + 50% apartado previo"
                 )
             else:
                 monto_de_este_ingreso = round(monto_total, 2)
-                nota_prorrateo = "Pago completo en esta quincena"
+                nota_prorrateo = "100% esta quincena"
 
             pagos_esta_quincena.append(
                 {
@@ -267,7 +237,6 @@ def planificar_quincena(
             cubetas[metodo] = round(cubetas[metodo] + monto_de_este_ingreso, 2)
 
         elif f_prox <= fecha_venc < f_sub and es_prorrateable:
-            # Vence en la SIGUIENTE quincena, pero es un gasto grande: apartamos el 50% hoy
             mitad = round(monto_total / 2.0, 2)
             apartados_siguiente_quincena.append(
                 {
@@ -277,7 +246,7 @@ def planificar_quincena(
                     "metodo_futuro": metodo,
                     "monto_total_recibo": round(monto_total, 2),
                     "monto_apartar_hoy": mitad,
-                    "nota": f"Apartar 50% en débito hoy para no sentir apretada la quincena del {f_prox.isoformat()}",
+                    "nota": f"Apartar 50% para quincena {f_prox.isoformat()}",
                 }
             )
 
@@ -288,7 +257,6 @@ def planificar_quincena(
         sum(a["monto_apartar_hoy"] for a in apartados_siguiente_quincena), 2
     )
 
-    # Analizar Tarjeta de Crédito (si existe)
     tarjetas = perfil.get("tarjetas_credito", [])
     analisis_tc = None
     apartado_tc_en_debito = round(cubetas["tc"], 2)
@@ -305,10 +273,6 @@ def planificar_quincena(
         apartado_tc_en_debito = analisis_tc["apartado_total_tc_en_debito"]
         pago_tc_saldo_anterior = analisis_tc["pago_saldo_anterior_en_quincena"]
 
-    # Compromisos obligatorios que salen del ingreso líquido de esta quincena:
-    # - Efectivo + Transferencias + Débito + Apartado TC (que cubre los cargos TC + saldo anterior si vence)
-    # - Apartados 50% para la próxima quincena
-    # - Gasto extra puntual (si el usuario indicó uno)
     total_pagos_directos_no_tc = round(
         cubetas["efectivo"] + cubetas["transferencia"] + cubetas["debito"], 2
     )
@@ -322,44 +286,35 @@ def planificar_quincena(
 
     disponible_despues_compromisos = round(ingreso - compromisos_totales, 2)
     alerta_liquidez = None
-
-    # Algoritmo de distribución "Nunca apretado + Ahorro fuerte":
-    # 1. Reservamos el ahorro mínimo objetivo si alcanza después de cubrir el piso de gastos libres.
     ahorro_minimo_objetivo = round(ingreso * (pct_ahorro_min / 100.0), 2)
 
     if disponible_despues_compromisos < 0:
         gastos_libres = 0.0
         ahorro_total = 0.0
         alerta_liquidez = (
-            f"ALERTA: Tus compromisos ({simbolo}{compromisos_totales:,.2f}) superan el ingreso "
-            f"de esta quincena ({simbolo}{ingreso:,.2f}) por {simbolo}{abs(disponible_despues_compromisos):,.2f}. "
-            "Se recomienda pausar temporalmente el apartado de prorrateo o reducir gastos variables."
+            f"ALERTA: Compromisos ({simbolo}{compromisos_totales:,.2f}) superan ingreso "
+            f"({simbolo}{ingreso:,.2f}) por {simbolo}{abs(disponible_despues_compromisos):,.2f}."
         )
     elif disponible_despues_compromisos <= piso_libres:
-        # Priorizamos que no se quede sin dinero para vivir/comer en la quincena
         gastos_libres = disponible_despues_compromisos
         ahorro_total = 0.0
         alerta_liquidez = (
-            f"Quincena ajustada: después de pagos y apartados quedan {simbolo}{disponible_despues_compromisos:,.2f}, "
-            f"que se asignan íntegros a tu piso de tranquilidad (gastos libres)."
+            f"Quincena ajustada: {simbolo}{disponible_despues_compromisos:,.2f} asignados a gastos libres."
         )
     elif disponible_despues_compromisos <= (piso_libres + ahorro_minimo_objetivo):
         gastos_libres = piso_libres
         ahorro_total = round(disponible_despues_compromisos - piso_libres, 2)
     else:
-        # Hay excedente por encima del piso de gastos libres + ahorro mínimo
         excedente = round(
             disponible_despues_compromisos - piso_libres - ahorro_minimo_objetivo, 2
         )
         ahorro_adicional = round(excedente * (pct_ahorro_excedente / 100.0), 2)
         libres_adicional = round(excedente - ahorro_adicional, 2)
-
         ahorro_total = round(ahorro_minimo_objetivo + ahorro_adicional, 2)
         gastos_libres = round(piso_libres + libres_adicional, 2)
 
     porcentaje_ahorro_real = round((ahorro_total / ingreso) * 100.0, 2) if ingreso > 0 else 0.0
 
-    # Desglose de metas de ahorro
     desglose_ahorro: list[dict[str, Any]] = []
     metas = perfil.get("metas_ahorro", [])
     acumulado_metas = 0.0
@@ -378,7 +333,6 @@ def planificar_quincena(
             }
         )
 
-    # Acciones exactas por método de pago para el día de depósito
     saldo_dejar_en_debito = round(
         cubetas["debito"]
         + apartado_tc_en_debito
@@ -403,10 +357,7 @@ def planificar_quincena(
     }
 
     verificacion_suma = round(
-        cubetas["efectivo"]
-        + cubetas["transferencia"]
-        + ahorro_total
-        + saldo_dejar_en_debito,
+        cubetas["efectivo"] + cubetas["transferencia"] + ahorro_total + saldo_dejar_en_debito,
         2,
     )
 
@@ -444,20 +395,213 @@ def planificar_quincena(
     }
 
 
-def renderizar_markdown(plan: dict[str, Any]) -> str:
-    """Convierte el resultado estructurado del motor en un reporte Markdown claro."""
+def evaluar_compra(
+    perfil: dict[str, Any],
+    monto_compra: float,
+    nombre_compra: str,
+    fecha_actual: dt.date,
+) -> dict[str, Any]:
+    """
+    Evalúa si conviene realizar una compra, cuál es la mejor fecha exacta del calendario
+    para hacerla (según fecha de corte de TC y flujo quincenal), y qué modalidad usar
+    (de contado al corte, cuotas 0% interés o ahorro programado) sin quedar apretado.
+    """
+    simbolo = perfil.get("simbolo_moneda", "$")
+    ingreso_ref = float(perfil.get("ingreso_referencia_quincenal", 2300.0))
+
+    # Simulamos una quincena típica de referencia para conocer su capacidad de ahorro libre real
+    plan_ref = planificar_quincena(perfil, ingreso_ref, fecha_actual)
+    ahorro_quincenal_tipico = max(0.0, plan_ref["resumen_montos"]["ahorro_fuerte_total"])
+    ahorro_mensual_tipico = round(ahorro_quincenal_tipico * 2.0, 2)
+
+    # Presupuesto seguro para destinar a una compra sin frenar su ahorro principal (40% del ahorro libre)
+    cuota_quincenal_segura = round(ahorro_quincenal_tipico * 0.40, 2)
+    cuota_mensual_segura = round(cuota_quincenal_segura * 2.0, 2)
+
+    tarjetas = perfil.get("tarjetas_credito", [])
+    info_tc: dict[str, Any] | None = None
+    if tarjetas:
+        tc = tarjetas[0]
+        dia_corte = int(tc.get("dia_corte", 6))
+        dia_limite = int(tc.get("dia_limite_pago", 1))
+        limite = float(tc.get("limite_credito", 10000.0))
+        tope_30 = round(limite * 0.30, 2)
+
+        gastos_tc_mes = sum(
+            float(g["monto"])
+            for g in perfil.get("gastos_fijos", [])
+            if str(g.get("metodo", "")).lower() == "tc"
+        )
+        saldo_previo = float(tc.get("saldo_al_corte_pendiente", 0.0)) + float(
+            tc.get("cuotas_fijas_mes", 0.0)
+        )
+        margen_30_disponible = round(max(0.0, tope_30 - gastos_tc_mes - saldo_previo), 2)
+
+        ciclo_hoy = calcular_ciclo_tc_para_fecha(fecha_actual, dia_corte, dia_limite)
+        proximo_corte = dt.date.fromisoformat(ciclo_hoy["fecha_corte"])
+        fecha_oro = proximo_corte + dt.timedelta(days=1)
+        ciclo_oro = calcular_ciclo_tc_para_fecha(fecha_oro, dia_corte, dia_limite)
+
+        dias_espera_oro = (fecha_oro - fecha_actual).days
+        conviene_esperar_corte = (
+            dias_espera_oro <= 15
+            and ciclo_oro["dias_financiamiento_gratis"]
+            > ciclo_hoy["dias_financiamiento_gratis"] + 10
+        )
+
+        info_tc = {
+            "tarjeta": tc.get("nombre", "TC"),
+            "limite_credito": limite,
+            "tope_saludable_30_pct": tope_30,
+            "margen_30_pct_disponible": margen_30_disponible,
+            "respeta_regla_30_pct": monto_compra <= margen_30_disponible,
+            "si_compras_hoy": ciclo_hoy,
+            "ventana_oro_recomendada": ciclo_oro,
+            "dias_espera_para_ventana_oro": dias_espera_oro,
+            "conviene_esperar_ventana_oro": conviene_esperar_corte,
+        }
+
+    # Detectar si existen deudas temporales grandes (ej. cuotas de computadora)
+    deudas_temporales = [
+        g
+        for g in perfil.get("gastos_fijos", [])
+        if g.get("categoria") == "deuda_temporal" or "cuota" in g.get("nombre", "").lower()
+    ]
+
+    # Determinar veredicto financiero (Semáforo)
+    quincenas_para_contado = (
+        round(monto_compra / max(1.0, ahorro_quincenal_tipico * 0.70), 1)
+        if ahorro_quincenal_tipico > 0
+        else 99.0
+    )
+
+    opciones_cuotas = []
+    for n_meses in (3, 6, 12):
+        cuota_mes = round(monto_compra / n_meses, 2)
+        cuota_q = round(cuota_mes / 2.0, 2)
+        holgado = cuota_q <= max(cuota_quincenal_segura, ahorro_quincenal_tipico * 0.50)
+        opciones_cuotas.append(
+            {
+                "plazo_meses": n_meses,
+                "cuota_mensual_0_interes": cuota_mes,
+                "apartado_por_quincena": cuota_q,
+                "viable_sin_apreton": holgado,
+            }
+        )
+
+    if monto_compra <= ahorro_quincenal_tipico * 0.75:
+        semaforo = "VERDE (Compra de Contado / 1 Pago al Corte)"
+        estrategia = (
+            f"Puedes pagarlo al 100% en 1 solo pago al corte sin tocar tu ahorro base ni tu piso de salidas. "
+            f"Apártalo de tu excedente de esta quincena."
+        )
+    elif monto_compra <= ahorro_mensual_tipico * 1.1:
+        semaforo = "VERDE-AMARILLO (Contado en Ventana de Oro o 3 Cuotas 0%)"
+        apartado_3q = round(monto_compra / 3.0, 2)
+        estrategia = (
+            f"Cómpralo en la Ventana de Oro de tu TC para ganar ~50 días y júntalo en 2-3 quincenas "
+            f"({simbolo}{apartado_3q:,.2f}/quincena), o pide 3 cuotas sin intereses."
+        )
+    elif opciones_cuotas[1]["viable_sin_apreton"]:
+        semaforo = "AMARILLO (Usar 6 Cuotas 0% Interés o Ahorro Programado)"
+        c6 = opciones_cuotas[1]
+        estrategia = (
+            f"De contado te apretaría, pero en 6 cuotas SIN intereses (0%) solo apartas "
+            f"{simbolo}{c6['apartado_por_quincena']:,.2f}/quincena ({simbolo}{c6['cuota_mensual_0_interes']:,.2f}/mes) "
+            f"y sigues ahorrando para tus metas principales."
+        )
+    else:
+        semaforo = "ROJO (Posponer o Ahorrar Previamente)"
+        estrategia = (
+            f"Excede tu margen cómodo actual. Recomendación: ahorrar {simbolo}{cuota_quincenal_segura:,.2f}/quincena "
+            f"o esperar a que se liberen compromisos actuales."
+        )
+        if deudas_temporales:
+            nombres_dt = ", ".join(d["nombre"] for d in deudas_temporales)
+            estrategia += f" Nota: cuando termines [{nombres_dt}] liberarás flujo extra para comprarlo sin presión."
+
+    return {
+        "compra": {
+            "nombre": nombre_compra or "Compra evaluada",
+            "monto": round(monto_compra, 2),
+            "simbolo": simbolo,
+            "fecha_evaluacion": fecha_actual.isoformat(),
+        },
+        "capacidad_usuario": {
+            "ingreso_quincenal_referencia": ingreso_ref,
+            "ahorro_libre_quincenal": ahorro_quincenal_tipico,
+            "cuota_quincenal_comoda_maxima": round(ahorro_quincenal_tipico * 0.50, 2),
+            "quincenas_necesarias_de_contado": quincenas_para_contado,
+        },
+        "semaforo": semaforo,
+        "estrategia_recomendada": estrategia,
+        "calendario_optimo_tc": info_tc,
+        "simulacion_cuotas_0_interes": opciones_cuotas,
+    }
+
+
+def renderizar_evaluacion_compra_md(ev: dict[str, Any]) -> str:
+    c = ev["compra"]
+    cap = ev["capacidad_usuario"]
+    s = c["simbolo"]
+    tc = ev.get("calendario_optimo_tc")
+
+    lines = [
+        f"# Asesor de Compras Arceus — {c['nombre']} ({s}{c['monto']:,.2f})",
+        "",
+        f"- **Veredicto:** **{ev['semaforo']}**",
+        f"- **Estrategia:** {ev['estrategia_recomendada']}",
+        f"- **Tu margen libre por quincena:** `{s}{cap['ahorro_libre_quincenal']:,.2f}` (cuota cómoda máx: `{s}{cap['cuota_quincenal_comoda_maxima']:,.2f}/quincena`)",
+        "",
+    ]
+
+    if tc:
+        hoy = tc["si_compras_hoy"]
+        oro = tc["ventana_oro_recomendada"]
+        marca_hoy = "✅ Óptimo hoy" if not tc["conviene_esperar_ventana_oro"] else "⚠️ Corto plazo"
+        marca_oro = "⭐ MEJOR FECHA (Ventana de Oro)"
+        lines.extend(
+            [
+                f"## 1. Mejor Fecha para Comprar con tu TC ({tc['tarjeta']})",
+                "",
+                "| Escenario | Fecha de compra | Fecha de corte | Fecha límite pago (0%) | Días gratis | Evaluación |",
+                "| :--- | :--- | :--- | :--- | ---: | :--- |",
+                f"| **Comprar HOY** | `{hoy['fecha_compra']}` | `{hoy['fecha_corte']}` | **`{hoy['fecha_limite_pago']}`** | `{hoy['dias_financiamiento_gratis']} días` | {marca_hoy} |",
+                f"| **Esperar post-corte** | **`{oro['fecha_compra']}`** | `{oro['fecha_corte']}` | **`{oro['fecha_limite_pago']}`** | **`{oro['dias_financiamiento_gratis']} días`** | {marca_oro} |",
+                "",
+                f"- **Impacto en Buró (Regla <30%):** Margen disponible bajo el 30%: `{s}{tc['margen_30_pct_disponible']:,.2f}` → "
+                + ("✅ Respeta el <30%." if tc["respeta_regla_30_pct"] else "⚠️ Supera el 30%; abona antes del corte o usa cuotas."),
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
+            "## 2. Simulación en Cuotas SIN Intereses (0%)",
+            "",
+            "| Plazo | Cuota Mensual | Apartado por Quincena | ¿Te deja tranquilo sin apretón? |",
+            "| :--- | ---: | ---: | :--- |",
+        ]
+    )
+    for op in ev["simulacion_cuotas_0_interes"]:
+        estado = "✅ Sí (Cómodo)" if op["viable_sin_apreton"] else "⚠️ Ajustado"
+        lines.append(
+            f"| **{op['plazo_meses']} meses** | `{s}{op['cuota_mensual_0_interes']:,.2f}/mes` | "
+            f"**`{s}{op['apartado_por_quincena']:,.2f}/quincena`** | {estado} |"
+        )
+
+    return "\n".join(lines)
+
+
+def renderizar_markdown(plan: dict[str, Any], compact: bool = False) -> str:
     m = plan["meta"]
     r = plan["resumen_montos"]
     a = plan["acciones_dia_pago"]
     s = m["simbolo"]
 
     lines: list[str] = [
-        f"# Plan Quincenal Arceus — {m['codigo_periodo']}",
-        "",
-        f"- **Fecha de ingreso:** `{m['fecha_pago']}` → **Próximo pago:** `{m['proximo_pago']}` ({m['dias_ventana']} días)",
-        f"- **Ingreso recibido:** **{s}{r['ingreso_quincena']:,.2f} {m['moneda']}**",
-        f"- **Ahorro Fuerte logrado:** **{s}{r['ahorro_fuerte_total']:,.2f}** (`{r['porcentaje_ahorro_real']}%` del ingreso)",
-        f"- **Disponible para gastos libres / salidas:** **{s}{r['gastos_libres_salidas']:,.2f}**",
+        f"# Plan Quincenal Arceus — {m['codigo_periodo']} ({m['fecha_pago']} → {m['proximo_pago']})",
+        f"**Ingreso:** `{s}{r['ingreso_quincena']:,.2f}` | **Ahorro Fuerte:** `{s}{r['ahorro_fuerte_total']:,.2f}` (`{r['porcentaje_ahorro_real']}%`) | **Libre (Salidas):** `{s}{r['gastos_libres_salidas']:,.2f}`",
         "",
     ]
 
@@ -466,34 +610,13 @@ def renderizar_markdown(plan: dict[str, Any]) -> str:
 
     lines.extend(
         [
-            "## 1. Acciones Inmediatas (Qué hacer hoy con tu dinero)",
-            "",
-            "| Acción / Cubeta | Monto | Instrucción exacta |",
+            "## 1. Cubetas de Acción (Hoy)",
+            "| Cubeta | Monto | Detalle |",
             "| :--- | ---: | :--- |",
-            f"| **1. Mover a Ahorro Fuerte** | **{s}{a['mover_a_cuenta_ahorro_fuerte']:,.2f}** | Pásalo hoy mismo a tu cuenta/apartado de ahorro (págate a ti primero). |",
-            f"| **2. Retirar en Efectivo** | **{s}{a['retirar_efectivo_cajero']:,.2f}** | Retíralo en una sola visita al cajero para tus pagos en efectivo de la quincena. |",
-            f"| **3. Transferencias Fijas** | **{s}{a['transferir_hoy_o_en_fecha']:,.2f}** | Para tus pagos por transferencia bancaria de esta quincena. |",
-            f"| **4. Dejar en Cuenta de Débito** | **{s}{a['dejar_en_cuenta_debito_total']:,.2f}** | Todo lo que se queda en tu cuenta (ver desglose de blindaje abajo). |",
-            f"| **Total cuadrado al centavo** | **{s}{r['verificacion_suma_exacta']:,.2f}** | Cuadra al 100% con tu ingreso de `{s}{r['ingreso_quincena']:,.2f}`. |",
-            "",
-            "### Desglose de lo que se queda en tu Tarjeta de Débito",
-            f"- **Cargos fijos con Débito:** `{s}{a['detalle_en_debito']['cargos_debito_fijos']:,.2f}`",
-            f"- **Apartado INTOCABLE para pagar Tarjeta de Crédito:** `{s}{a['detalle_en_debito']['apartado_intocable_tc']:,.2f}`",
-            f"- **Apartado 50% (Anti-Apretón) para pagos fuertes de la próxima quincena:** `{s}{a['detalle_en_debito']['apartado_prorrateo_proxima_quincena']:,.2f}`",
-        ]
-    )
-
-    if r["gasto_extra"] > 0:
-        nota = f" ({r['nota_gasto_extra']})" if r["nota_gasto_extra"] else ""
-        lines.append(
-            f"- **Reserva para gasto extra de esta quincena{nota}:** `{s}{r['gasto_extra']:,.2f}`"
-        )
-
-    lines.extend(
-        [
-            f"- **Libre para tus salidas y gastos diarios (sin culpa):** **`{s}{a['detalle_en_debito']['disponible_gastos_libres_y_salidas']:,.2f}`**",
-            "",
-            "## 2. Calendario de Pagos de Esta Quincena",
+            f"| **Ahorro Fuerte** | **{s}{a['mover_a_cuenta_ahorro_fuerte']:,.2f}** | Págate a ti primero |",
+            f"| **Retirar Efectivo** | **{s}{a['retirar_efectivo_cajero']:,.2f}** | 1 visita al cajero |",
+            f"| **Transferencias** | **{s}{a['transferir_hoy_o_en_fecha']:,.2f}** | Pagos por transferencia |",
+            f"| **Dejar en Débito** | **{s}{a['dejar_en_cuenta_debito_total']:,.2f}** | Débito fijo `{s}{a['detalle_en_debito']['cargos_debito_fijos']:,.2f}` + Apartado TC `{s}{a['detalle_en_debito']['apartado_intocable_tc']:,.2f}` + Anti-Apretón 50% `{s}{a['detalle_en_debito']['apartado_prorrateo_proxima_quincena']:,.2f}` + Libre `{s}{a['detalle_en_debito']['disponible_gastos_libres_y_salidas']:,.2f}` |",
             "",
         ]
     )
@@ -501,43 +624,37 @@ def renderizar_markdown(plan: dict[str, Any]) -> str:
     if plan["calendario_pagos_quincena"]:
         lines.extend(
             [
-                "| Fecha límite | Gasto fijo | Método | Recibo total | Sale de esta quincena | Nota |",
+                "## 2. Calendario de Pagos (Esta Quincena)",
+                "| Fecha | Gasto | Método | Recibo | Sale hoy | Nota |",
                 "| :--- | :--- | :--- | ---: | ---: | :--- |",
             ]
         )
         for p in plan["calendario_pagos_quincena"]:
-            metodo_badge = p["metodo"].upper()
             lines.append(
-                f"| `{p['fecha_vencimiento']}` | {p['nombre']} | `{metodo_badge}` | "
+                f"| `{p['fecha_vencimiento']}` | {p['nombre']} | `{p['metodo'].upper()}` | "
                 f"{s}{p['monto_total_recibo']:,.2f} | **{s}{p['monto_de_este_ingreso']:,.2f}** | {p['nota']} |"
             )
-    else:
-        lines.append("_No hay pagos fijos con vencimiento directo dentro de esta ventana._")
-
-    lines.append("")
+        lines.append("")
 
     if plan["apartados_prorrateo"]:
         lines.extend(
             [
-                "## 3. Blindaje Anti-Apretón (Apartados 50% para la Próxima Quincena)",
-                "",
-                "| Vence el | Gasto fuerte | Método futuro | Recibo total | Apartar HOY (50%) | Propósito |",
-                "| :--- | :--- | :--- | ---: | ---: | :--- |",
+                "## 3. Blindaje Anti-Apretón (50% Próxima Quincena)",
+                "| Vence | Gasto fuerte | Recibo | Apartar HOY (50%) |",
+                "| :--- | :--- | ---: | ---: |",
             ]
         )
         for ap in plan["apartados_prorrateo"]:
             lines.append(
-                f"| `{ap['fecha_vencimiento']}` | {ap['nombre']} | `{ap['metodo_futuro'].upper()}` | "
-                f"{s}{ap['monto_total_recibo']:,.2f} | **{s}{ap['monto_apartar_hoy']:,.2f}** | {ap['nota']} |"
+                f"| `{ap['fecha_vencimiento']}` | {ap['nombre']} | {s}{ap['monto_total_recibo']:,.2f} | **{s}{ap['monto_apartar_hoy']:,.2f}** |"
             )
         lines.append("")
 
-    if plan["desglose_ahorro"]:
+    if plan["desglose_ahorro"] and not compact:
         lines.extend(
             [
-                "## 4. Distribución de tu Ahorro Fuerte",
-                "",
-                "| Meta de Ahorro | % del Ahorro | Monto a depositar hoy |",
+                "## 4. Metas de Ahorro",
+                "| Meta | % | Monto |",
                 "| :--- | ---: | ---: |",
             ]
         )
@@ -551,15 +668,9 @@ def renderizar_markdown(plan: dict[str, Any]) -> str:
     if tc:
         lines.extend(
             [
-                f"## 5. Estrategia para tu Tarjeta de Crédito ({tc['nombre']})",
-                "",
-                f"- **Próxima fecha de corte:** `{tc['proximo_corte']}` (en **{tc['dias_para_corte']} días**)",
-                f"- **Próxima fecha límite de pago:** `{tc['proximo_limite_pago']}` (en **{tc['dias_para_limite_pago']} días**)",
-                f"- **Gastos fijos que pagarás con TC esta quincena:** `{s}{tc['cargos_tc_quincena']:,.2f}`",
-                f"- **Apartado total en Débito para ser Totalero (0% intereses):** **`{s}{tc['apartado_total_tc_en_debito']:,.2f}`**",
-                f"- **Uso proyectado de línea de crédito:** `{tc['porcentaje_uso_estimado']}%` (tope saludable 30%: `{s}{tc['limite_saludable_30_pct']:,.2f}`)",
-                "",
-                "### Consejos de Arceus para tu TC en esta quincena:",
+                f"## 5. Tarjeta de Crédito ({tc['nombre']})",
+                f"- **Corte:** `{tc['proximo_corte']}` ({tc['dias_para_corte']}d) | **Límite pago:** `{tc['proximo_limite_pago']}` ({tc['dias_para_limite_pago']}d) | **Mejor fecha para comprar:** `{tc['ventana_oro_compras']}` (~{tc['dias_financiamiento_ventana_oro']}d sin interés)",
+                f"- **Cargos TC quincena:** `{s}{tc['cargos_tc_quincena']:,.2f}` | **Apartado Totalero en Débito:** **`{s}{tc['apartado_total_tc_en_debito']:,.2f}`** | **Uso:** `{tc['porcentaje_uso_estimado']}%`",
             ]
         )
         for c in tc["consejos"]:
@@ -570,7 +681,6 @@ def renderizar_markdown(plan: dict[str, Any]) -> str:
 
 
 def guardar_reporte_e_historial(plan: dict[str, Any], markdown_text: str) -> dict[str, str]:
-    """Guarda el reporte Markdown en `reportes/` y registra la fila en `historial/quincenas.csv`."""
     REPORTES_DIR.mkdir(parents=True, exist_ok=True)
     HISTORIAL_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -620,62 +730,21 @@ def guardar_reporte_e_historial(plan: dict[str, Any], markdown_text: str) -> dic
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Motor determinista de planificación financiera quincenal Arceus."
+        description="Motor determinista de planificación financiera y asesor de compras Arceus."
     )
-    parser.add_argument(
-        "--check-setup",
-        action="store_true",
-        help="Verifica si el perfil del usuario ya existe o si se debe iniciar la entrevista inicial.",
-    )
-    parser.add_argument(
-        "--perfil",
-        type=Path,
-        default=DEFAULT_PROFILE_PATH,
-        help="Ruta al archivo JSON de perfil del usuario (por defecto: perfil/usuario.json).",
-    )
-    parser.add_argument(
-        "--usar-ejemplo",
-        action="store_true",
-        help="Usa perfil/usuario.example.json para pruebas o demostraciones.",
-    )
-    parser.add_argument(
-        "--ingreso",
-        type=float,
-        help="Monto recibido en la quincena/depósito actual.",
-    )
-    parser.add_argument(
-        "--fecha",
-        type=str,
-        default=dt.date.today().isoformat(),
-        help="Fecha del depósito en formato YYYY-MM-DD (por defecto: hoy).",
-    )
-    parser.add_argument(
-        "--gasto-extra",
-        type=float,
-        default=0.0,
-        help="Monto de algún gasto extraordinario o salida especial en esta quincena.",
-    )
-    parser.add_argument(
-        "--nota-extra",
-        type=str,
-        default="",
-        help="Descripción del gasto extraordinario.",
-    )
-    parser.add_argument(
-        "--sin-prorrateo-previo",
-        action="store_true",
-        help="Indica que es la primera quincena usando Arceus y aún no hay 50%% apartado de la quincena anterior.",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Imprime la salida en formato JSON estructurado.",
-    )
-    parser.add_argument(
-        "--guardar",
-        action="store_true",
-        help="Guarda el reporte en reportes/ y agrega el registro a historial/quincenas.csv.",
-    )
+    parser.add_argument("--check-setup", action="store_true", help="Verifica estado del perfil.")
+    parser.add_argument("--perfil", type=Path, default=DEFAULT_PROFILE_PATH)
+    parser.add_argument("--usar-ejemplo", action="store_true")
+    parser.add_argument("--ingreso", type=float, help="Monto recibido en la quincena.")
+    parser.add_argument("--evaluar-compra", type=float, help="Monto de una compra que el usuario desea evaluar.")
+    parser.add_argument("--nombre-compra", type=str, default="Compra deseada", help="Nombre del artículo a comprar.")
+    parser.add_argument("--fecha", type=str, default=dt.date.today().isoformat(), help="Fecha YYYY-MM-DD.")
+    parser.add_argument("--gasto-extra", type=float, default=0.0)
+    parser.add_argument("--nota-extra", type=str, default="")
+    parser.add_argument("--sin-prorrateo-previo", action="store_true")
+    parser.add_argument("--compact", action="store_true", help="Salida ultra-compacta para ahorrar tokens.")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--guardar", action="store_true")
 
     args = parser.parse_args(argv)
     perfil_path = EXAMPLE_PROFILE_PATH if args.usar_ejemplo else args.perfil
@@ -688,85 +757,57 @@ def main(argv: list[str] | None = None) -> int:
                     json.dumps(
                         {
                             "configurado": True,
-                            "modo": "PLANIFICACION_QUINCENAL",
-                            "perfil_path": str(perfil_path),
+                            "modo": "OPERATIVO",
                             "usuario": data.get("nombre_usuario"),
                             "moneda": data.get("moneda"),
-                            "gastos_fijos_registrados": len(data.get("gastos_fijos", [])),
-                            "tarjetas_registradas": len(data.get("tarjetas_credito", [])),
+                            "gastos": len(data.get("gastos_fijos", [])),
+                            "tc": len(data.get("tarjetas_credito", [])),
                         },
                         ensure_ascii=False,
-                        indent=2,
                     )
                 )
                 return 0
             except Exception as exc:
-                print(
-                    json.dumps(
-                        {
-                            "configurado": False,
-                            "modo": "ENTREVISTA_INICIAL",
-                            "error": f"El archivo de perfil existe pero tiene un error de formato: {exc}",
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-                )
+                print(json.dumps({"configurado": False, "modo": "ENTREVISTA_INICIAL", "error": str(exc)}))
                 return 1
-        else:
-            print(
-                json.dumps(
-                    {
-                        "configurado": False,
-                        "modo": "ENTREVISTA_INICIAL",
-                        "mensaje": (
-                            "No existe perfil/usuario.json. Arceus debe iniciar la entrevista "
-                            "paso a paso para conocer la situación financiera del usuario."
-                        ),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-            return 0
+        print(json.dumps({"configurado": False, "modo": "ENTREVISTA_INICIAL"}))
+        return 0
 
     if not perfil_path.exists():
         print(
-            json.dumps(
-                {
-                    "error": "PERFIL_NO_CONFIGURADO",
-                    "modo_requerido": "ENTREVISTA_INICIAL",
-                    "mensaje": (
-                        f"No se encontró {perfil_path}. Ejecuta primero la entrevista inicial "
-                        "de Arceus (/setup) para crear el perfil financiero del usuario."
-                    ),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
+            json.dumps({"error": "PERFIL_NO_CONFIGURADO", "modo_requerido": "ENTREVISTA_INICIAL"}),
             file=sys.stderr,
         )
         return 2
 
-    if args.ingreso is None or args.ingreso <= 0:
-        parser.error("Debes indicar un monto válido con --ingreso <MONTO>.")
-
-    fecha_pago = dt.date.fromisoformat(args.fecha)
+    fecha_ref = dt.date.fromisoformat(args.fecha)
     perfil = json.loads(perfil_path.read_text(encoding="utf-8"))
+
+    if args.evaluar_compra is not None:
+        if args.evaluar_compra <= 0:
+            parser.error("--evaluar-compra requiere un monto mayor a 0.")
+        ev = evaluar_compra(perfil, args.evaluar_compra, args.nombre_compra, fecha_ref)
+        if args.json:
+            print(json.dumps(ev, ensure_ascii=False, indent=2))
+        else:
+            print(renderizar_evaluacion_compra_md(ev))
+        return 0
+
+    if args.ingreso is None or args.ingreso <= 0:
+        parser.error("Indica --ingreso <MONTO> o --evaluar-compra <MONTO>.")
 
     plan = planificar_quincena(
         perfil=perfil,
         ingreso=args.ingreso,
-        fecha_pago=fecha_pago,
+        fecha_pago=fecha_ref,
         gasto_extra=args.gasto_extra,
         nota_extra=args.nota_extra,
         usar_prorrateo_previo=not args.sin_prorrateo_previo,
     )
-    md = renderizar_markdown(plan)
+    md = renderizar_markdown(plan, compact=args.compact)
 
     if args.guardar and not args.usar_ejemplo:
-        archivos = guardar_reporte_e_historial(plan, md)
-        plan["archivos_generados"] = archivos
+        plan["archivos_generados"] = guardar_reporte_e_historial(plan, md)
 
     if args.json:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
