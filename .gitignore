@@ -1,0 +1,41 @@
+# =============================================================================
+# PRIVACIDAD FINANCIERA (NUNCA SUBIR DATOS PERSONALES A GITHUB)
+# =============================================================================
+# Cualquier persona que clone arceus-finanzas tendrá sus propios archivos locales
+# generados durante la entrevista inicial de Arceus. Estos archivos se ignoran
+# para que ni tú ni ningún usuario suban sus ingresos o gastos reales por error.
+
+perfil/usuario.json
+perfil/resumen-perfil.md
+perfil/*.local.*
+
+# Historial y reportes personales generados quincena a quincena
+historial/*.csv
+historial/*.json
+!historial/.gitkeep
+!historial/quincenas.example.csv
+
+reportes/*.md
+reportes/*.html
+!reportes/.gitkeep
+!reportes/reporte-ejemplo.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+
+# Entorno y sistema operativo
+.env
+.env.*
+.DS_Store
+Thumbs.db
+
+# Editores y memoria local de agentes
+.vscode/
+.idea/
+.claude/projects/
+.claude/settings.local.json

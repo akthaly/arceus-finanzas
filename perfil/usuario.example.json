@@ -1,0 +1,90 @@
+{
+  "$schema": "./schema.json",
+  "nombre_usuario": "Ejemplo",
+  "moneda": "GTQ",
+  "simbolo_moneda": "Q",
+  "frecuencia_pago": "quincenal",
+  "dias_pago": [15, 30],
+  "ingreso_variable": true,
+  "ingreso_referencia_quincenal": 4500.0,
+  "reglas_liquidez": {
+    "piso_gastos_libres_quincenal": 800.0,
+    "suavizar_gastos_grandes": true,
+    "umbral_gasto_grande": 1000.0,
+    "porcentaje_ahorro_minimo": 15.0,
+    "porcentaje_ahorro_excedente": 70.0
+  },
+  "gastos_fijos": [
+    {
+      "id": "renta",
+      "nombre": "Renta / Alquiler",
+      "monto": 2000.0,
+      "dia_pago": 1,
+      "metodo": "transferencia",
+      "prorratear_entre_quincenas": true,
+      "categoria": "vivienda"
+    },
+    {
+      "id": "internet",
+      "nombre": "Internet residencial",
+      "monto": 350.0,
+      "dia_pago": 10,
+      "metodo": "tc",
+      "prorratear_entre_quincenas": false,
+      "categoria": "servicios"
+    },
+    {
+      "id": "gimnasio",
+      "nombre": "Gimnasio",
+      "monto": 250.0,
+      "dia_pago": 18,
+      "metodo": "debito",
+      "prorratear_entre_quincenas": false,
+      "categoria": "salud"
+    },
+    {
+      "id": "transporte_efectivo",
+      "nombre": "Transporte / Parqueos / Efectivo fijo",
+      "monto": 300.0,
+      "dia_pago": 16,
+      "metodo": "efectivo",
+      "prorratear_entre_quincenas": false,
+      "categoria": "transporte"
+    },
+    {
+      "id": "ayuda_casa",
+      "nombre": "Aporte familiar / Casa",
+      "monto": 500.0,
+      "dia_pago": 28,
+      "metodo": "efectivo",
+      "prorratear_entre_quincenas": false,
+      "categoria": "familia"
+    }
+  ],
+  "tarjetas_credito": [
+    {
+      "id": "tc_principal",
+      "nombre": "Mi Primera TC",
+      "es_primera_tc": true,
+      "limite_credito": 6000.0,
+      "dia_corte": 8,
+      "dia_limite_pago": 28,
+      "saldo_al_corte_pendiente": 0.0,
+      "cuotas_fijas_mes": 0.0
+    }
+  ],
+  "metas_ahorro": [
+    {
+      "id": "fondo_emergencia",
+      "nombre": "Fondo de Emergencia (3 meses)",
+      "prioridad": 1,
+      "porcentaje_del_ahorro": 60
+    },
+    {
+      "id": "inversion_o_meta",
+      "nombre": "Ahorro Fuerte / Inversión",
+      "prioridad": 2,
+      "porcentaje_del_ahorro": 40
+    }
+  ]
+}
