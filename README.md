@@ -96,8 +96,11 @@ Puedes ver una demostración inmediata con el perfil de ejemplo incluido:
 # Ver estado de configuración del usuario
 python tools/arceus_engine.py --check-setup
 
-# Simular una quincena de 4,850 con el perfil de ejemplo
-python tools/arceus_engine.py --usar-ejemplo --ingreso 4850 --fecha 2026-11-15
+# Simular una quincena de 4,850 con el perfil de ejemplo (modo compacto para ahorrar tokens)
+python tools/arceus_engine.py --usar-ejemplo --ingreso 4850 --fecha 2026-11-15 --compact
+
+# Evaluar si conviene hacer una compra y cuál es la mejor fecha exacta del calendario
+python tools/arceus_engine.py --usar-ejemplo --evaluar-compra 1200 --nombre-compra "Ropa Fin de Año" --fecha 2026-12-05
 
 # Ejecutar los tests unitarios
 python -m unittest discover -s tools -p "test_*.py"
