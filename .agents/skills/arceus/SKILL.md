@@ -42,15 +42,16 @@ Muestra la tabla resultante y máximo 3 consejos accionables.
 
 ---
 
-## Fase C: Evaluar Compra y Mejor Fecha para Comprar (`/compra`)
-Cuando el usuario pregunte *"¿Cuándo me conviene comprar X?"*, *"¿Cuánto puedo gastar en X?"* o *"Quiero comprar X de monto Y"*, ejecuta en 1 llamada:
+## Fase C: Evaluar Compra, Temporadas Festivas (Guatemala) y Mejor Fecha (`/compra`)
+Cuando el usuario pregunte *"¿Cuándo me conviene comprar X?"*, *"¿Compro en Black Friday, Navidad o Enero?"* o *"Quiero comprar X de monto Y"*, ejecuta en 1 llamada:
 ```bash
 python tools/arceus_engine.py --evaluar-compra <MONTO> --nombre-compra "<ARTICULO>" --fecha <YYYY-MM-DD>
 ```
+*(Opcional: `--categoria-compra ropa|tecnologia|regalos|general`, por defecto lo detecta automáticamente del nombre).*
 El motor calcula automáticamente:
+- **Calendario Festivo de Guatemala + Corte TC:** Compara Black Friday/Black Weekend GT, ventana Post-Corte Pre-Aguinaldo, inflación de Navidad (12-24 dic) y Liquidaciones de Inicio de Año (Enero GT) según la categoría.
 - **Semáforo de viabilidad** (Verde: contado al corte; Amarillo: 3-6 cuotas 0% interés; Rojo: posponer/ahorrar o esperar fin de deuda temporal).
-- **Calendario óptimo con TC (Comprar HOY vs. Ventana de Oro 1 día después del corte)** para ganar 45-55 días sin intereses.
-- **Impacto en regla <30% del buró** y tabla de **cuotas 0% interés (3, 6, 12 meses)** frente a su margen libre quincenal.
+- **Ciclo exacto con TC (Comprar HOY vs. Ventana de Oro `dia_corte + 1`)**, regla `<30%` del buró y tabla de **cuotas 0% interés (3, 6, 12 meses)**.
 
 ---
 

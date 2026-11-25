@@ -66,6 +66,9 @@ class TestArceusEngine(unittest.TestCase):
         md = renderizar_evaluacion_compra_md(ev)
         self.assertIn("Ventana de Oro", md)
         self.assertIn("Simulación en Cuotas SIN Intereses", md)
+        self.assertIn("Calendario de Temporadas y Fechas Festivas (Guatemala)", md)
+        self.assertEqual(ev["compra"]["categoria"], "ropa")
+        self.assertEqual(len(ev["temporadas_festivas_guatemala"]["comparativa_fechas_festivas"]), 4)
 
 
 if __name__ == "__main__":
