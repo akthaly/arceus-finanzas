@@ -368,11 +368,26 @@ def planificar_quincena(
     f_prox: dt.date = ventana["proximo_pago"]
     f_sub: dt.date = ventana["subsiguiente_pago"]
 
+    # Verificar si esta fecha corresponde al próximo pago programado con cubetas ya apartadas
+    prog = perfil.get("proximo_pago_programado", {})
+    es_pago_programado = prog.get("fecha") == f_ini.isoformat()
+    gastos_cubiertos_cubeta: dict[str, str] = (
+        prog.get("gastos_ya_cubiertos_en_cubetas", {}) if es_pago_programado else {}
+    )
+    fondos_extra_cubetas = float(prog.get("fondos_extra_de_cubetas", 0.0)) if es_pago_programado else 0.0
+    detalle_fondos_extra = str(prog.get("detalle_fondos_extra", "")) if es_pago_programado else ""
+    efectivo_en_mano = float(prog.get("efectivo_ya_en_mano", 0.0)) if es_pago_programado else 0.0
+    if es_pago_programado and prog.get("sin_prorrateo_previo"):
+        usar_prorrateo_previo = False
+
+    ingreso_disponible_total = round(ingreso + fondos_extra_cubetas, 2)
+
     pagos_esta_quincena: list[dict[str, Any]] = []
     apartados_siguiente_quincena: list[dict[str, Any]] = []
     cubetas = {"efectivo": 0.0, "transferencia": 0.0, "debito": 0.0, "tc": 0.0}
 
     for gasto in perfil.get("gastos_fijos", []):
+        gid = gasto.get("id", gasto["nombre"])
         nombre = gasto["nombre"]
         monto_total = float(gasto["monto"])
         dia_pago = int(gasto["dia_pago"])
@@ -387,7 +402,10 @@ def planificar_quincena(
         fecha_venc = proxima_ocurrencia_dia(f_ini, dia_pago)
 
         if f_ini <= fecha_venc < f_prox:
-            if es_prorrateable and usar_prorrateo_previo:
+            if gid in gastos_cubiertos_cubeta:
+                monto_de_este_ingreso = 0.0
+                nota_prorrateo = f"Q0 de este pago ({gastos_cubiertos_cubeta[gid]})"
+            elif es_prorrateable and usar_prorrateo_previo:
                 monto_de_este_ingreso = round(monto_total / 2.0, 2)
                 nota_prorrateo = (
                     f"50% hoy ({simbolo}{monto_de_este_ingreso:,.2f}) + 50% apartado previo"
@@ -411,7 +429,7 @@ def planificar_quincena(
             )
             cubetas[metodo] = round(cubetas[metodo] + monto_de_este_ingreso, 2)
 
-        elif f_prox <= fecha_venc < f_sub and es_prorrateable:
+        elif f_prox <= fecha_venc < f_sub and es_prorrateable and not es_pago_programado:
             mitad = round(monto_total / 2.0, 2)
             apartados_siguiente_quincena.append(
                 {
@@ -459,9 +477,9 @@ def planificar_quincena(
         2,
     )
 
-    disponible_despues_compromisos = round(ingreso - compromisos_totales, 2)
+    disponible_despues_compromisos = round(ingreso_disponible_total - compromisos_totales, 2)
     alerta_liquidez = None
-    ahorro_minimo_objetivo = round(ingreso * (pct_ahorro_min / 100.0), 2)
+    ahorro_minimo_objetivo = round(ingreso_disponible_total * (pct_ahorro_min / 100.0), 2)
 
     if disponible_despues_compromisos < 0:
         gastos_libres = 0.0
@@ -553,6 +571,10 @@ def planificar_quincena(
         },
         "resumen_montos": {
             "ingreso_quincena": round(ingreso, 2),
+            "fondos_extra_cubetas": round(fondos_extra_cubetas, 2),
+            "detalle_fondos_extra": detalle_fondos_extra,
+            "ingreso_total_distribuido": ingreso_disponible_total,
+            "efectivo_ya_en_mano": round(efectivo_en_mano, 2),
             "pagos_directos_no_tc": total_pagos_directos_no_tc,
             "apartado_tc_en_debito": apartado_tc_en_debito,
             "pago_tc_saldo_anterior": pago_tc_saldo_anterior,
@@ -560,11 +582,12 @@ def planificar_quincena(
             "gasto_extra": round(gasto_extra, 2),
             "nota_gasto_extra": nota_extra,
             "gastos_libres_salidas": gastos_libres,
+            "gastos_libres_mas_efectivo_mano": round(gastos_libres + efectivo_en_mano, 2),
             "presupuesto_semanal_libres": presupuesto_semanal_libres,
             "ahorro_fuerte_total": ahorro_total,
             "porcentaje_ahorro_real": porcentaje_ahorro_real,
             "verificacion_suma_exacta": verificacion_suma,
-            "diferencia_redondeo": round(ingreso - verificacion_suma, 2),
+            "diferencia_redondeo": round(ingreso_disponible_total - verificacion_suma, 2),
         },
         "alerta_liquidez": alerta_liquidez,
         "cubetas_metodo_pago": cubetas,
@@ -808,7 +831,18 @@ def renderizar_markdown(plan: dict[str, Any], compact: bool = False) -> str:
 
     lines: list[str] = [
         f"# {titulo_plan} — {m['codigo_periodo']} ({m['fecha_pago']} → {m['proximo_pago']})",
-        f"**Ingreso:** `{s}{r['ingreso_quincena']:,.2f}` | **Ahorro Fuerte:** `{s}{r['ahorro_fuerte_total']:,.2f}` (`{r['porcentaje_ahorro_real']}%`) | **Libre (Salidas):** `{s}{r['gastos_libres_salidas']:,.2f}` (`{s}{r['presupuesto_semanal_libres']:,.2f}/semana`)",
+        f"**Ingreso depósito:** `{s}{r['ingreso_quincena']:,.2f}`"
+        + (
+            f" + **Liberado de cubetas (`SAT/Salario`):** `{s}{r['fondos_extra_cubetas']:,.2f}` = **Total a distribuir: `{s}{r['ingreso_total_distribuido']:,.2f}`**"
+            if r.get("fondos_extra_cubetas", 0) > 0
+            else ""
+        ),
+        f"**Ahorro Fuerte nuevo:** `{s}{r['ahorro_fuerte_total']:,.2f}` (`{r['porcentaje_ahorro_real']}%`) | **Libre en cubeta `Gastar`:** `{s}{r['gastos_libres_salidas']:,.2f}`"
+        + (
+            f" (+ `{s}{r['efectivo_ya_en_mano']:,.2f}` en Efectivo = **`{s}{r['gastos_libres_mas_efectivo_mano']:,.2f}` libres totales**)"
+            if r.get("efectivo_ya_en_mano", 0) > 0
+            else f" (`{s}{r['presupuesto_semanal_libres']:,.2f}/semana`)"
+        ),
         "",
     ]
 
@@ -883,6 +917,17 @@ def renderizar_markdown(plan: dict[str, Any], compact: bool = False) -> str:
         for c in tc["consejos"]:
             lines.append(f"- {c}")
         lines.append("")
+
+    cubetas = plan.get("saldos_actuales_cubetas")
+    if cubetas:
+        resumen_cubetas = " | ".join(f"`{k}`: **{s}{float(v):,.2f}**" for k, v in cubetas.items())
+        lines.extend(
+            [
+                "## 6. Saldos Actuales en Cubetas (App)",
+                resumen_cubetas,
+                "",
+            ]
+        )
 
     return "\n".join(lines)
 
@@ -974,6 +1019,10 @@ def main(argv: list[str] | None = None) -> int:
                             "modo": "OPERATIVO",
                             "usuario": data.get("nombre_usuario"),
                             "moneda": data.get("moneda"),
+                            "frecuencia_pago": data.get("frecuencia_pago", "quincenal"),
+                            "ingreso_referencia": data.get("ingreso_referencia_quincenal")
+                            or data.get("ingreso_referencia_mensual"),
+                            "proximo_pago_programado": data.get("proximo_pago_programado"),
                             "gastos": len(data.get("gastos_fijos", [])),
                             "tc": len(data.get("tarjetas_credito", [])),
                         },
@@ -994,8 +1043,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    fecha_ref = dt.date.fromisoformat(args.fecha)
     perfil = json.loads(perfil_path.read_text(encoding="utf-8"))
+    prog = perfil.get("proximo_pago_programado", {})
+    if "--fecha" not in (argv or sys.argv[1:]) and args.ingreso is None and prog.get("fecha"):
+        fecha_ref = dt.date.fromisoformat(prog["fecha"])
+    else:
+        fecha_ref = dt.date.fromisoformat(args.fecha)
 
     if args.evaluar_compra is not None:
         if args.evaluar_compra <= 0:
@@ -1013,17 +1066,30 @@ def main(argv: list[str] | None = None) -> int:
             print(renderizar_evaluacion_compra_md(ev))
         return 0
 
-    if args.ingreso is None or args.ingreso <= 0:
+    ingreso_efectivo = args.ingreso
+    if ingreso_efectivo is None:
+        if prog.get("fecha") == fecha_ref.isoformat() and prog.get("ingreso_esperado"):
+            ingreso_efectivo = float(prog["ingreso_esperado"])
+        else:
+            ingreso_efectivo = float(
+                perfil.get("ingreso_referencia_quincenal")
+                or perfil.get("ingreso_referencia_mensual")
+                or 0.0
+            )
+
+    if ingreso_efectivo <= 0:
         parser.error("Indica --ingreso <MONTO> o --evaluar-compra <MONTO>.")
 
     plan = planificar_quincena(
         perfil=perfil,
-        ingreso=args.ingreso,
+        ingreso=ingreso_efectivo,
         fecha_pago=fecha_ref,
         gasto_extra=args.gasto_extra,
         nota_extra=args.nota_extra,
         usar_prorrateo_previo=not args.sin_prorrateo_previo,
     )
+    if perfil.get("saldos_actuales_cubetas"):
+        plan["saldos_actuales_cubetas"] = perfil["saldos_actuales_cubetas"]
     md = renderizar_markdown(plan, compact=args.compact)
 
     if args.guardar and not args.usar_ejemplo:
