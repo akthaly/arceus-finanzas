@@ -39,3 +39,7 @@ Thumbs.db
 .idea/
 .claude/projects/
 .claude/settings.local.json
+
+# Archivos intermedios de construcción del video promocional
+video-promo/build_assets/
+

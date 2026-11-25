@@ -24,7 +24,7 @@ Ejecuta: `python tools/arceus_engine.py --check-setup`
 
 ## Fase A: Entrevista Inicial (Solo usuarios sin `perfil/usuario.json`)
 Haz preguntas breves en **4 bloques** (espera respuesta entre bloques). Recuerda al usuario que `perfil/usuario.json` está en `.gitignore` y nunca sube a GitHub (jamás guardes DPI, nombres legales completos ni números de tarjeta):
-1. **Ingresos:** Alias/nombre, moneda (`GTQ`/`MXN`/`USD`), días de pago (ej. `[15, 30]`) e ingreso neto quincenal habitual.
+1. **Ingresos:** Alias/nombre, moneda (`GTQ`/`MXN`/`USD`), frecuencia (`"quincenal"` con 2 días ej. `[15, 30]` o `"mensual"` con 1 día ej. `[30]`) e ingreso neto habitual por pago.
 2. **Gastos Fijos:** Nombre, monto, día de pago (`1..31`) y método (`efectivo`, `transferencia`, `debito`, `tc`).
 3. **Tarjeta de Crédito:** Nombre/banco, límite, `dia_corte`, `dia_limite_pago` y `saldo_al_corte_pendiente`.
 4. **Liquidez y Ahorro:** Piso de gastos libres por quincena (`piso_gastos_libres_quincenal`), si desea prorratear 50/50 gastos grandes (`>= umbral_gasto_grande`) y metas de ahorro.
