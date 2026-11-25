@@ -3,7 +3,7 @@
 Motor determinista de Arceus Finanzas (tools/arceus_engine.py).
 Optimizado para bajo consumo de tokens: resuelve en 1 sola llamada:
 1. Planificación quincenal exacta (--ingreso)
-2. Evaluador de compras y calendario óptimo de compra (--evaluar-compra)
+2. Evaluador de compras + Ventana de Oro TC + Calendario Festivo Guatemala (--evaluar-compra)
 3. Verificación de estado de configuración (--check-setup)
 """
 
@@ -22,7 +22,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_PROFILE_PATH = ROOT_DIR / "perfil" / "usuario.json"
 EXAMPLE_PROFILE_PATH = ROOT_DIR / "perfil" / "usuario.example.json"
 HISTORIAL_CSV_PATH = ROOT_DIR / "historial" / "quincenas.csv"
-REPORTES_DIR = ROOTES_DIR = ROOT_DIR / "reportes"
+REPORTES_DIR = ROOT_DIR / "reportes"
 
 
 def clamp_day(year: int, month: int, day: int) -> dt.date:
@@ -49,14 +49,7 @@ def proxima_ocurrencia_dia(desde: dt.date, dia_mes: int) -> dt.date:
 def calcular_ciclo_tc_para_fecha(
     fecha_compra: dt.date, dia_corte: int, dia_limite_pago: int
 ) -> dict[str, Any]:
-    """
-    Calcula para una fecha de compra específica:
-    - En qué fecha de corte entra esa compra
-    - Cuál es la fecha límite de pago para no generar intereses (0%)
-    - Cuántos días reales de financiamiento gratis obtiene el usuario
-    """
     corte_compra = proxima_ocurrencia_dia(fecha_compra, dia_corte)
-    # La fecha límite de pago siempre es posterior a la fecha de corte en que cierra el estado
     limite_pago = proxima_ocurrencia_dia(corte_compra + dt.timedelta(days=1), dia_limite_pago)
     dias_financiamiento = (limite_pago - fecha_compra).days
     return {
@@ -64,6 +57,174 @@ def calcular_ciclo_tc_para_fecha(
         "fecha_corte": corte_compra.isoformat(),
         "fecha_limite_pago": limite_pago.isoformat(),
         "dias_financiamiento_gratis": dias_financiamiento,
+    }
+
+
+def detectar_categoria_compra(nombre_compra: str, categoria_explicita: str = "") -> str:
+    if categoria_explicita and categoria_explicita != "auto":
+        return categoria_explicita.lower()
+    txt = nombre_compra.lower()
+    if any(
+        k in txt
+        for k in ("ropa", "zapatos", "tenis", "camisa", "pantalon", "outfit", "vestido", "chumpa", "calzado")
+    ):
+        return "ropa"
+    if any(
+        k in txt
+        for k in (
+            "telefono",
+            "celular",
+            "iphone",
+            "laptop",
+            "computadora",
+            "pc",
+            "monitor",
+            "audifonos",
+            "tv",
+            "tele",
+            "consola",
+            "ipad",
+            "tablet",
+            "tecnologia",
+        )
+    ):
+        return "tecnologia"
+    if any(k in txt for k in ("regalo", "navidad", "amigo secreto", "juguetes")):
+        return "regalos"
+    return "general"
+
+
+def analizar_temporadas_festivas_gt(
+    fecha_actual: dt.date,
+    categoria: str,
+    dia_corte: int,
+    dia_limite_pago: int,
+) -> dict[str, Any]:
+    """
+    Evalúa el calendario comercial y festivo de Guatemala (Black Friday/Black Weekend,
+    Temporada de Aguinaldo y Navidad, Liquidaciones de Fin de Año e Inicios de Enero,
+    y Bono 14 en Julio) cruzado con el día de corte de la Tarjeta de Crédito del usuario.
+    """
+    year = fecha_actual.year
+    next_yr = year + 1 if fecha_actual.month >= 11 else year
+
+    # Fechas clave de fin de año e inicio de año en Guatemala
+    corte_dic = clamp_day(year if fecha_actual.month >= 11 else year, 12, dia_corte)
+    post_corte_dic = corte_dic + dt.timedelta(days=1)
+    corte_ene = clamp_day(next_yr, 1, dia_corte)
+    post_corte_ene = corte_ene + dt.timedelta(days=1)
+
+    ciclo_bf = calcular_ciclo_tc_para_fecha(dt.date(year, 11, 27), dia_corte, dia_limite_pago)
+    ciclo_post_dic = calcular_ciclo_tc_para_fecha(post_corte_dic, dia_corte, dia_limite_pago)
+    ciclo_post_ene = calcular_ciclo_tc_para_fecha(post_corte_ene, dia_corte, dia_limite_pago)
+
+    ventanas_festivas: list[dict[str, str]] = []
+
+    if categoria == "ropa":
+        estrategia_temporada = (
+            "ESTRATEGIA ROPA GUATEMALA (Regla 30/70): En Guatemala, del 10 al 24 de diciembre (entrada del Aguinaldo) "
+            "la ropa está en su PRECIO MÁS CARO del año. "
+            f"Divide tu compra: 1) Usa el 30% de tu presupuesto el {post_corte_dic.isoformat()} (1 día después de tu corte de TC) "
+            "solo para lo que quieras estrenar en Navidad/Año Nuevo. "
+            f"2) Guarda el 70% para la Liquidación de Inicios de Año (desde el {post_corte_ene.isoformat()}, post-corte de enero), "
+            "cuando las tiendas en GT rematan inventario con 30% a 60% de descuento real y pagas hasta marzo."
+        )
+        ventanas_festivas = [
+            {
+                "temporada": "1. Black Friday / Black Weekend GT (Fin de Nov)",
+                "fechas": f"{year}-11-27 al {year}-11-30",
+                "descuento_tipico_gt": "15% a 30% (seleccionados)",
+                "impacto_tc": f"Corta el {ciclo_bf['fecha_corte']} -> Pagas el {ciclo_bf['fecha_limite_pago']} ({ciclo_bf['dias_financiamiento_gratis']}d)",
+                "veredicto": "⚠️ Solo si hay >=30% real o NeoCuotas 0% (porque toca pagarlo el 1 de enero).",
+            },
+            {
+                "temporada": "2. Ventana Post-Corte Pre-Aguinaldo (Inicios Dic)",
+                "fechas": f"{post_corte_dic.isoformat()} al {year}-12-11",
+                "descuento_tipico_gt": "Precio normal / Promos bancarias",
+                "impacto_tc": f"Corta el {ciclo_post_dic['fecha_corte']} -> Pagas el {ciclo_post_dic['fecha_limite_pago']} ({ciclo_post_dic['dias_financiamiento_gratis']}d)",
+                "veredicto": "✅ Ideal para comprar SOLO el estreno de Navidad/Año Nuevo (56 días sin interés).",
+            },
+            {
+                "temporada": "3. Fiebre de Aguinaldo y Navidad (12 al 24 Dic)",
+                "fechas": f"{year}-12-12 al {year}-12-24",
+                "descuento_tipico_gt": "0% (Precios más altos del año en GT)",
+                "impacto_tc": f"Corta el {ciclo_post_dic['fecha_corte']} -> Pagas el {ciclo_post_dic['fecha_limite_pago']}",
+                "veredicto": "❌ EVITAR: Centros comerciales llenos y ropa a precio completo sin rebaja.",
+            },
+            {
+                "temporada": "4. Liquidación Fin de Año e Inicios de Enero (Rebajas GT)",
+                "fechas": f"{year}-12-26 y {post_corte_ene.isoformat()} al {next_yr}-01-20",
+                "descuento_tipico_gt": "30% a 60% OFF (Liquidación total)",
+                "impacto_tc": f"Comprando el {post_corte_ene.isoformat()} pagas hasta {ciclo_post_ene['fecha_limite_pago']} ({ciclo_post_ene['dias_financiamiento_gratis']}d)",
+                "veredicto": "⭐ MEJOR MOMENTO DEL AÑO PARA ROPA: Mitad de precio + pagas hasta marzo.",
+            },
+        ]
+    elif categoria == "tecnologia":
+        estrategia_temporada = (
+            "ESTRATEGIA TECNOLOGÍA GUATEMALA: Para electrónica y tecnología, los mejores precios reales en GT "
+            "están en Black Friday / Cyber Monday (última semana de noviembre) y en Liquidaciones de Enero "
+            "(cuando liquidan modelos del año anterior). Si compras en Black Friday y tu corte es el día 6, "
+            "pídelo en NeoCuotas/Visacuotas 0% interés para que no te golpee el pago de contado el 1 de enero."
+        )
+        ventanas_festivas = [
+            {
+                "temporada": "1. Black Friday / Cyber Monday GT",
+                "fechas": f"{year}-11-27 al {year}-11-30",
+                "descuento_tipico_gt": "20% a 40% OFF + Cuotas 0%",
+                "impacto_tc": f"Corta el {ciclo_bf['fecha_corte']} -> Pagas el {ciclo_bf['fecha_limite_pago']}",
+                "veredicto": "⭐ MEJOR PRECIO EN TECH: Aprovechar con NeoCuotas 0% interés.",
+            },
+            {
+                "temporada": "2. Post-Corte Diciembre",
+                "fechas": f"Desde el {post_corte_dic.isoformat()}",
+                "descuento_tipico_gt": "10% a 20% (combos navideños)",
+                "impacto_tc": f"Pagas hasta el {ciclo_post_dic['fecha_limite_pago']} ({ciclo_post_dic['dias_financiamiento_gratis']}d gratis)",
+                "veredicto": "✅ Mejor financiamiento si vas a pagar en 1 solo pago al corte.",
+            },
+            {
+                "temporada": "3. Liquidación de Inventario Enero (Inicios de Año)",
+                "fechas": f"{post_corte_ene.isoformat()} al {next_yr}-01-25",
+                "descuento_tipico_gt": "25% a 45% en modelos {year}",
+                "impacto_tc": f"Pagas hasta el {ciclo_post_ene['fecha_limite_pago']} ({ciclo_post_ene['dias_financiamiento_gratis']}d gratis)",
+                "veredicto": "⭐ Excelente para laptops/monitores con 50+ días de financiamiento.",
+            },
+        ]
+    else:
+        estrategia_temporada = (
+            "ESTRATEGIA DE TEMPORADA GUATEMALA: Evita comprar entre el 12 y el 24 de diciembre (efecto Aguinaldo: "
+            "precios inflados y poca disponibilidad). Tus dos mejores ventanas son: "
+            f"1) El {post_corte_dic.isoformat()} (1 día después de tu corte de diciembre, ganas ~55 días sin interés). "
+            f"2) A partir del {post_corte_ene.isoformat()} (liquidaciones de inicio de año en Guatemala con descuentos de 30%-50%)."
+        )
+        ventanas_festivas = [
+            {
+                "temporada": "1. Black Weekend GT (Fin de Nov)",
+                "fechas": f"{year}-11-27 al {year}-11-30",
+                "descuento_tipico_gt": "15% a 35% OFF",
+                "impacto_tc": f"Corta el {ciclo_bf['fecha_corte']} -> Pagas el {ciclo_bf['fecha_limite_pago']}",
+                "veredicto": "✅ Bueno si usas cuotas 0% interés (en 1 pago vence el 1 de enero).",
+            },
+            {
+                "temporada": "2. Ventana de Oro Post-Corte Diciembre",
+                "fechas": f"{post_corte_dic.isoformat()} al {year}-12-11",
+                "descuento_tipico_gt": "Promos pre-navideñas",
+                "impacto_tc": f"Pagas hasta el {ciclo_post_dic['fecha_limite_pago']} ({ciclo_post_dic['dias_financiamiento_gratis']}d gratis)",
+                "veredicto": "⭐ Mejor fecha en diciembre antes de la inflación del Aguinaldo.",
+            },
+            {
+                "temporada": "3. Liquidación de Inicio de Año (Enero GT)",
+                "fechas": f"{post_corte_ene.isoformat()} al {next_yr}-01-20",
+                "descuento_tipico_gt": "30% a 50% OFF post-fiestas",
+                "impacto_tc": f"Pagas hasta el {ciclo_post_ene['fecha_limite_pago']} ({ciclo_post_ene['dias_financiamiento_gratis']}d gratis)",
+                "veredicto": "⭐ MEJOR PRECIO + FINANCIAMIENTO si la compra puede esperar a enero.",
+            },
+        ]
+
+    return {
+        "pais": "Guatemala",
+        "categoria_detectada": categoria,
+        "estrategia_temporada_gt": estrategia_temporada,
+        "comparativa_fechas_festivas": ventanas_festivas,
     }
 
 
@@ -400,26 +561,22 @@ def evaluar_compra(
     monto_compra: float,
     nombre_compra: str,
     fecha_actual: dt.date,
+    categoria_compra: str = "auto",
 ) -> dict[str, Any]:
-    """
-    Evalúa si conviene realizar una compra, cuál es la mejor fecha exacta del calendario
-    para hacerla (según fecha de corte de TC y flujo quincenal), y qué modalidad usar
-    (de contado al corte, cuotas 0% interés o ahorro programado) sin quedar apretado.
-    """
     simbolo = perfil.get("simbolo_moneda", "$")
     ingreso_ref = float(perfil.get("ingreso_referencia_quincenal", 2300.0))
+    categoria = detectar_categoria_compra(nombre_compra, categoria_compra)
 
-    # Simulamos una quincena típica de referencia para conocer su capacidad de ahorro libre real
     plan_ref = planificar_quincena(perfil, ingreso_ref, fecha_actual)
     ahorro_quincenal_tipico = max(0.0, plan_ref["resumen_montos"]["ahorro_fuerte_total"])
     ahorro_mensual_tipico = round(ahorro_quincenal_tipico * 2.0, 2)
 
-    # Presupuesto seguro para destinar a una compra sin frenar su ahorro principal (40% del ahorro libre)
     cuota_quincenal_segura = round(ahorro_quincenal_tipico * 0.40, 2)
-    cuota_mensual_segura = round(cuota_quincenal_segura * 2.0, 2)
 
     tarjetas = perfil.get("tarjetas_credito", [])
     info_tc: dict[str, Any] | None = None
+    dia_corte = 6
+    dia_limite = 1
     if tarjetas:
         tc = tarjetas[0]
         dia_corte = int(tc.get("dia_corte", 6))
@@ -461,14 +618,19 @@ def evaluar_compra(
             "conviene_esperar_ventana_oro": conviene_esperar_corte,
         }
 
-    # Detectar si existen deudas temporales grandes (ej. cuotas de computadora)
+    temporadas_gt = analizar_temporadas_festivas_gt(
+        fecha_actual=fecha_actual,
+        categoria=categoria,
+        dia_corte=dia_corte,
+        dia_limite_pago=dia_limite,
+    )
+
     deudas_temporales = [
         g
         for g in perfil.get("gastos_fijos", [])
         if g.get("categoria") == "deuda_temporal" or "cuota" in g.get("nombre", "").lower()
     ]
 
-    # Determinar veredicto financiero (Semáforo)
     quincenas_para_contado = (
         round(monto_compra / max(1.0, ahorro_quincenal_tipico * 0.70), 1)
         if ahorro_quincenal_tipico > 0
@@ -492,8 +654,8 @@ def evaluar_compra(
     if monto_compra <= ahorro_quincenal_tipico * 0.75:
         semaforo = "VERDE (Compra de Contado / 1 Pago al Corte)"
         estrategia = (
-            f"Puedes pagarlo al 100% en 1 solo pago al corte sin tocar tu ahorro base ni tu piso de salidas. "
-            f"Apártalo de tu excedente de esta quincena."
+            "Puedes pagarlo al 100% en 1 solo pago al corte sin tocar tu ahorro base ni tu piso de salidas. "
+            "Apártalo de tu excedente de esta quincena."
         )
     elif monto_compra <= ahorro_mensual_tipico * 1.1:
         semaforo = "VERDE-AMARILLO (Contado en Ventana de Oro o 3 Cuotas 0%)"
@@ -508,13 +670,13 @@ def evaluar_compra(
         estrategia = (
             f"De contado te apretaría, pero en 6 cuotas SIN intereses (0%) solo apartas "
             f"{simbolo}{c6['apartado_por_quincena']:,.2f}/quincena ({simbolo}{c6['cuota_mensual_0_interes']:,.2f}/mes) "
-            f"y sigues ahorrando para tus metas principales."
+            "y sigues ahorrando para tus metas principales."
         )
     else:
         semaforo = "ROJO (Posponer o Ahorrar Previamente)"
         estrategia = (
             f"Excede tu margen cómodo actual. Recomendación: ahorrar {simbolo}{cuota_quincenal_segura:,.2f}/quincena "
-            f"o esperar a que se liberen compromisos actuales."
+            "o esperar a que se liberen compromisos actuales."
         )
         if deudas_temporales:
             nombres_dt = ", ".join(d["nombre"] for d in deudas_temporales)
@@ -523,6 +685,7 @@ def evaluar_compra(
     return {
         "compra": {
             "nombre": nombre_compra or "Compra evaluada",
+            "categoria": categoria,
             "monto": round(monto_compra, 2),
             "simbolo": simbolo,
             "fecha_evaluacion": fecha_actual.isoformat(),
@@ -536,6 +699,7 @@ def evaluar_compra(
         "semaforo": semaforo,
         "estrategia_recomendada": estrategia,
         "calendario_optimo_tc": info_tc,
+        "temporadas_festivas_guatemala": temporadas_gt,
         "simulacion_cuotas_0_interes": opciones_cuotas,
     }
 
@@ -545,26 +709,44 @@ def renderizar_evaluacion_compra_md(ev: dict[str, Any]) -> str:
     cap = ev["capacidad_usuario"]
     s = c["simbolo"]
     tc = ev.get("calendario_optimo_tc")
+    gt = ev.get("temporadas_festivas_guatemala")
 
     lines = [
-        f"# Asesor de Compras Arceus — {c['nombre']} ({s}{c['monto']:,.2f})",
+        f"# Asesor de Compras Arceus — {c['nombre']} ({s}{c['monto']:,.2f}) [{c['categoria'].upper()}]",
         "",
-        f"- **Veredicto:** **{ev['semaforo']}**",
-        f"- **Estrategia:** {ev['estrategia_recomendada']}",
+        f"- **Veredicto Financiero:** **{ev['semaforo']}**",
+        f"- **Estrategia de Flujo:** {ev['estrategia_recomendada']}",
         f"- **Tu margen libre por quincena:** `{s}{cap['ahorro_libre_quincenal']:,.2f}` (cuota cómoda máx: `{s}{cap['cuota_quincenal_comoda_maxima']:,.2f}/quincena`)",
         "",
     ]
+
+    if gt:
+        lines.extend(
+            [
+                "## 1. Calendario de Temporadas y Fechas Festivas (Guatemala)",
+                "",
+                f"> 💡 **{gt['estrategia_temporada_gt']}**",
+                "",
+                "| Temporada en Guatemala | Fechas Clave | Descuento Típico GT | Impacto en tu TC | Recomendación Arceus |",
+                "| :--- | :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for v in gt["comparativa_fechas_festivas"]:
+            lines.append(
+                f"| **{v['temporada']}** | `{v['fechas']}` | {v['descuento_tipico_gt']} | {v['impacto_tc']} | {v['veredicto']} |"
+            )
+        lines.append("")
 
     if tc:
         hoy = tc["si_compras_hoy"]
         oro = tc["ventana_oro_recomendada"]
         marca_hoy = "✅ Óptimo hoy" if not tc["conviene_esperar_ventana_oro"] else "⚠️ Corto plazo"
-        marca_oro = "⭐ MEJOR FECHA (Ventana de Oro)"
+        marca_oro = "⭐ MEJOR FECHA TC (Ventana de Oro)"
         lines.extend(
             [
-                f"## 1. Mejor Fecha para Comprar con tu TC ({tc['tarjeta']})",
+                f"## 2. Ciclo Exacto de tu Tarjeta ({tc['tarjeta']})",
                 "",
-                "| Escenario | Fecha de compra | Fecha de corte | Fecha límite pago (0%) | Días gratis | Evaluación |",
+                "| Escenario | Fecha compra | Fecha corte | Fecha límite pago (0%) | Días gratis | Evaluación |",
                 "| :--- | :--- | :--- | :--- | ---: | :--- |",
                 f"| **Comprar HOY** | `{hoy['fecha_compra']}` | `{hoy['fecha_corte']}` | **`{hoy['fecha_limite_pago']}`** | `{hoy['dias_financiamiento_gratis']} días` | {marca_hoy} |",
                 f"| **Esperar post-corte** | **`{oro['fecha_compra']}`** | `{oro['fecha_corte']}` | **`{oro['fecha_limite_pago']}`** | **`{oro['dias_financiamiento_gratis']} días`** | {marca_oro} |",
@@ -577,7 +759,7 @@ def renderizar_evaluacion_compra_md(ev: dict[str, Any]) -> str:
 
     lines.extend(
         [
-            "## 2. Simulación en Cuotas SIN Intereses (0%)",
+            "## 3. Simulación en Cuotas SIN Intereses (0%)",
             "",
             "| Plazo | Cuota Mensual | Apartado por Quincena | ¿Te deja tranquilo sin apretón? |",
             "| :--- | ---: | ---: | :--- |",
@@ -736,13 +918,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--perfil", type=Path, default=DEFAULT_PROFILE_PATH)
     parser.add_argument("--usar-ejemplo", action="store_true")
     parser.add_argument("--ingreso", type=float, help="Monto recibido en la quincena.")
-    parser.add_argument("--evaluar-compra", type=float, help="Monto de una compra que el usuario desea evaluar.")
-    parser.add_argument("--nombre-compra", type=str, default="Compra deseada", help="Nombre del artículo a comprar.")
-    parser.add_argument("--fecha", type=str, default=dt.date.today().isoformat(), help="Fecha YYYY-MM-DD.")
+    parser.add_argument("--evaluar-compra", type=float, help="Monto de una compra a evaluar.")
+    parser.add_argument("--nombre-compra", type=str, default="Compra deseada")
+    parser.add_argument(
+        "--categoria-compra",
+        type=str,
+        default="auto",
+        choices=["auto", "ropa", "tecnologia", "regalos", "general"],
+        help="Categoría para evaluar temporadas festivas en Guatemala.",
+    )
+    parser.add_argument("--fecha", type=str, default=dt.date.today().isoformat())
     parser.add_argument("--gasto-extra", type=float, default=0.0)
     parser.add_argument("--nota-extra", type=str, default="")
     parser.add_argument("--sin-prorrateo-previo", action="store_true")
-    parser.add_argument("--compact", action="store_true", help="Salida ultra-compacta para ahorrar tokens.")
+    parser.add_argument("--compact", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--guardar", action="store_true")
 
@@ -786,7 +975,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.evaluar_compra is not None:
         if args.evaluar_compra <= 0:
             parser.error("--evaluar-compra requiere un monto mayor a 0.")
-        ev = evaluar_compra(perfil, args.evaluar_compra, args.nombre_compra, fecha_ref)
+        ev = evaluar_compra(
+            perfil,
+            args.evaluar_compra,
+            args.nombre_compra,
+            fecha_ref,
+            args.categoria_compra,
+        )
         if args.json:
             print(json.dumps(ev, ensure_ascii=False, indent=2))
         else:
